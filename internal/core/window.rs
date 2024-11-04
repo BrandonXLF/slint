@@ -436,9 +436,14 @@ pub struct WindowInner {
     minimized: Cell<bool>,
 
     /// Stack of currently active popups
-    active_popups: RefCell<Vec<PopupWindow>>,
+    active_popups: RefCell<Vec<Rc<PopupWindow>>>,
     next_popup_id: Cell<NonZeroU32>,
-    had_popup_on_press: Cell<bool>,
+    // Close policies recorded during the last press event
+    recorded_close_policies: RefCell<Vec<(core::num::NonZero<u32>, PopupClosePolicy)>>,
+    // Recorded ID of the popup the last mouse event interacted with
+    mouse_event_popup_id: RefCell<Option<core::num::NonZero<u32>>>,
+    // A reference to the popup the last mouse event interacted with if it has not been closed
+    mouse_event_popup_weak: RefCell<Option<Weak<PopupWindow>>>,
     close_requested: Callback<(), CloseRequestResponse>,
     click_state: ClickState,
     pub(crate) ctx: once_cell::unsync::Lazy<crate::SlintContext>,
@@ -500,7 +505,9 @@ impl WindowInner {
             cursor_blinker: Default::default(),
             active_popups: Default::default(),
             next_popup_id: Cell::new(NonZeroU32::MIN),
-            had_popup_on_press: Default::default(),
+            recorded_close_policies: Default::default(),
+            mouse_event_popup_id: Default::default(),
+            mouse_event_popup_weak: Default::default(),
             close_requested: Default::default(),
             click_state: ClickState::default(),
             prevent_focus_change: Default::default(),
@@ -557,6 +564,113 @@ impl WindowInner {
         self.component.borrow().upgrade()
     }
 
+    /// Record state about the current active popups including the close policies for
+    /// active popups and their popup that was clicked by the given position.
+    ///
+    /// This should be called before the mouse event is processed so newly generated
+    /// popups are not processed.
+    ///
+    /// Arguments:
+    /// * `event`: The mouse event received by the windowing system.
+    /// * `global_position`: If popups are rendered in their own top-level window, this
+    /// is the global position of the event.
+    pub fn record_popup_states(&self, event: &MouseEvent, global_position: Option<LogicalPoint>) {
+        let pressed_event = matches!(event, MouseEvent::Pressed { .. });
+
+        if pressed_event {
+            self.recorded_close_policies.replace(
+                self.active_popups
+                    .borrow()
+                    .iter()
+                    .map(|popup| (popup.popup_id, popup.close_policy))
+                    .collect(),
+            );
+        }
+
+        let active_popups = self.active_popups.borrow();
+
+        let mouse_event_popup = active_popups.iter().rev().find_map(|popup| {
+            let mouse_inside_popup = match popup.clone().as_ref() {
+                PopupWindow { location: PopupWindowLocation::TopLevel(window_adapter), .. } => {
+                    match global_position {
+                        Some(global_position) => {
+                            let pos = window_adapter.window().position();
+                            let size = window_adapter.window().size();
+                            let geom = LogicalRect::new(
+                                LogicalPoint::new(pos.x as _, pos.y as _),
+                                crate::lengths::LogicalSize::new(size.width as _, size.height as _),
+                            );
+                            geom.contains(global_position)
+                        }
+                        None => true,
+                    }
+                }
+                PopupWindow {
+                    location: PopupWindowLocation::ChildWindow(coordinates),
+                    component,
+                    ..
+                } => match event.position() {
+                    Some(pos) => {
+                        let geom = ItemTreeRc::borrow_pin(&component).as_ref().item_geometry(0);
+                        geom.contains(pos - coordinates.to_vector())
+                    }
+                    None => true,
+                },
+            };
+
+            if mouse_inside_popup {
+                Some(popup)
+            } else {
+                None
+            }
+        });
+
+        *self.mouse_event_popup_id.borrow_mut() = mouse_event_popup.map(|popup| popup.popup_id);
+        *self.mouse_event_popup_weak.borrow_mut() =
+            mouse_event_popup.map(|popup| Rc::downgrade(popup));
+    }
+
+    /// Process the recorded close policies of popups, closing them if necessary.
+    pub fn process_close_policies(&self, event: &MouseEvent) {
+        let pressed_event = matches!(event, MouseEvent::Pressed { .. });
+        let released_event = matches!(event, MouseEvent::Released { .. });
+
+        if !pressed_event && !released_event {
+            return;
+        }
+
+        for close_info in self.recorded_close_policies.borrow().iter() {
+            let mouse_inside_popup_or_newer = self
+                .mouse_event_popup_id
+                .borrow()
+                .map(|mouse_event_popup_id| mouse_event_popup_id >= close_info.0)
+                .unwrap_or(false);
+
+            let close_event =
+                if mouse_inside_popup_or_newer { released_event } else { pressed_event };
+
+            match close_info.1 {
+                PopupClosePolicy::CloseOnClick => {
+                    if close_event {
+                        self.close_popup(close_info.0);
+                    }
+                }
+                PopupClosePolicy::CloseOnClickOutside => {
+                    let mouse_inside_popup = self
+                        .mouse_event_popup_id
+                        .borrow()
+                        .map(|mouse_event_popup_id| mouse_event_popup_id == close_info.0)
+                        .unwrap_or(false);
+
+                    if !mouse_inside_popup && close_event {
+                        self.close_popup(close_info.0);
+                    }
+                }
+                PopupClosePolicy::NoAutoClose => {}
+            };
+        }
+    }
+
     /// Receive a mouse event and pass it to the items of the component to
     /// change their state.
     ///
@@ -570,9 +684,7 @@ impl WindowInner {
         // handle multiple press release
         event = self.click_state.check_repeat(event, self.ctx.platform().click_interval());
 
-        let pressed_event = matches!(event, MouseEvent::Pressed { .. });
         let released_event = matches!(event, MouseEvent::Released { .. });
-
         let window_adapter = self.window_adapter();
         let mut mouse_input_state = self.mouse_input_state.take();
         let last_top_item = mouse_input_state.top_item_including_delayed();
@@ -581,35 +693,27 @@ impl WindowInner {
                 crate::input::process_delayed_event(&window_adapter, mouse_input_state);
         }
 
-        if pressed_event {
-            self.had_popup_on_press.set(!self.active_popups.borrow().is_empty());
-        }
-
-        let close_policy = self.top_close_policy();
-        let mut mouse_inside_popup = false;
+        self.record_popup_states(&event, None);
 
         mouse_input_state = if let Some(mut event) =
             crate::input::handle_mouse_grab(event, &window_adapter, &mut mouse_input_state)
         {
-            let (item_tree, offset) = if let Some(PopupWindow {
-                location: PopupWindowLocation::ChildWindow(coordinates),
-                component,
-                ..
-            }) = self.active_popups.borrow().last()
-            {
-                let geom = ItemTreeRc::borrow_pin(component).as_ref().item_geometry(0);
-
-                mouse_inside_popup = event
-                    .position()
-                    .map_or(true, |pos| geom.contains(pos - coordinates.to_vector()));
-
-                if mouse_inside_popup {
-                    (Some(component.clone()), *coordinates)
+            let (item_tree, offset) = {
+                if let Some(PopupWindow {
+                    location: PopupWindowLocation::ChildWindow(coordinates),
+                    component,
+                    ..
+                }) = self
+                    .mouse_event_popup_weak
+                    .borrow()
+                    .as_ref()
+                    .and_then(|x| x.upgrade())
+                    .and_then(|x| std::rc::Rc::<PopupWindow>::into_inner(x))
+                {
+                    (Some(component.clone()), coordinates)
                 } else {
-                    (None, LogicalPoint::default())
+                    (self.component.borrow().upgrade(), LogicalPoint::default())
                 }
-            } else {
-                (self.component.borrow().upgrade(), LogicalPoint::default())
             };
 
             if let Some(item_tree) = item_tree {
@@ -644,22 +748,7 @@ impl WindowInner {
 
         self.mouse_input_state.set(mouse_input_state);
 
-        match close_policy {
-            PopupClosePolicy::CloseOnClick => {
-                if (mouse_inside_popup && released_event && self.had_popup_on_press.get())
-                    || (!mouse_inside_popup && pressed_event)
-                {
-                    self.close_top_popup();
-                }
-            }
-            PopupClosePolicy::CloseOnClickOutside => {
-                if !mouse_inside_popup && pressed_event {
-                    self.close_top_popup();
-                }
-            }
-            PopupClosePolicy::NoAutoClose => {}
-        };
-
+        self.process_close_policies(&event);
         crate::properties::ChangeTracker::run_change_handlers();
     }
 
@@ -1077,12 +1166,10 @@ impl WindowInner {
             }
         };
 
-        self.active_popups.borrow_mut().push(PopupWindow {
-            popup_id,
-            location,
-            component: popup_componentrc.clone(),
-            close_policy,
-        });
+        self.active_popups.borrow_mut().push(
+            PopupWindow { popup_id, location, component: popup_componentrc.clone(), close_policy }
+                .into(),
+        );
 
         popup_id
     }
@@ -1126,21 +1213,6 @@ impl WindowInner {
         for popup in self.active_popups.take() {
             self.close_popup_impl(&popup);
         }
-    }
-
-    /// Close the top-most popup.
-    pub fn close_top_popup(&self) {
-        if let Some(popup) = self.active_popups.borrow_mut().pop() {
-            self.close_popup_impl(&popup);
-        }
-    }
-
-    /// Returns the close policy of the top-most popup. PopupClosePolicy::NoAutoClose if there is no active popup.
-    pub fn top_close_policy(&self) -> PopupClosePolicy {
-        self.active_popups
-            .borrow()
-            .last()
-            .map_or(PopupClosePolicy::NoAutoClose, |popup| popup.close_policy)
     }
 
     /// Returns the scale factor set on the window, as provided by the windowing system.
